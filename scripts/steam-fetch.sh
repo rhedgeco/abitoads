@@ -58,9 +58,15 @@ echo "Steam Guard code). Downloading ${#ids[@]} item(s)..."
 echo
 
 # steam-run provides the FHS environment the Steam binary needs on NixOS.
-# NIXPKGS_ALLOW_UNFREE is required because steam-run is unfree.
-NIXPKGS_ALLOW_UNFREE=1 nix-shell --impure -p steam-run \
-  --run "steam-run $work/steamcmd.sh ${cmd[*]}"
+# If steam-run is already on PATH (e.g. inside the devenv shell), use it
+# directly; otherwise fall back to fetching it via nix-shell. steam-run is
+# unfree, hence NIXPKGS_ALLOW_UNFREE for the fallback.
+if command -v steam-run >/dev/null 2>&1; then
+  steam-run "$work/steamcmd.sh" "${cmd[@]}"
+else
+  NIXPKGS_ALLOW_UNFREE=1 nix-shell --impure -p steam-run \
+    --run "steam-run $work/steamcmd.sh ${cmd[*]}"
+fi
 
 echo
 echo "Done. Downloaded content is under:"

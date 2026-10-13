@@ -1,0 +1,6 @@
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+
+# steamcmd/steam-run is unfree. Allow it so the dev shell can include it.
+allowUnfree: true
