@@ -1,0 +1,3 @@
+# Local Steam Workshop fetch artifacts (steamcmd binaries + downloaded content).
+# These are pulled on-demand with scripts/steam-fetch.sh and never committed.
+/.steam-fetch/

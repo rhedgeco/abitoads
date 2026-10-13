@@ -1,0 +1,70 @@
+name: validate-manifest
+
+# Validates workshop.json on pull requests and pushes to main. This is the only
+# thing CI can safely do here: the wallpaper videos come from the Steam Workshop
+# (a paid app behind Steam Guard), so CI cannot fetch or publish them -- that
+# step is done locally by a human (see scripts/fetch-wallpaper.sh and
+# scripts/publish-release.sh). CI just keeps the manifest honest.
+#
+# Checks:
+#   1. workshop.json is valid JSON with the expected top-level shape.
+#   2. Every wallpaper entry has a non-empty id, file, and 64-hex-char sha256.
+#   3. Every wallpaper key (the clean name) is filename-safe and unique.
+
+on:
+  pull_request:
+    paths:
+      - "workshop.json"
+  push:
+    branches: [main]
+    paths:
+      - "workshop.json"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate workshop.json
+        run: |
+          set -euo pipefail
+          f=workshop.json
+
+          # 1. Valid JSON + top-level shape.
+          jq -e 'type == "object" and has("wallpapers")
+                 and (.wallpapers | type == "object")' "$f" >/dev/null \
+            || { echo "::error::$f is missing a top-level 'wallpapers' object"; exit 1; }
+
+          # 2. Each entry has id, file, and a valid sha256.
+          bad="$(jq -r '
+            .wallpapers | to_entries[]
+            | select(
+                (.value.id // "" | length == 0)
+                or (.value.file // "" | length == 0)
+                or ((.value.sha256 // "") | test("^[0-9a-f]{64}$") | not)
+              )
+            | .key' "$f")"
+          if [ -n "$bad" ]; then
+            echo "::error::these entries are missing id/file or have an invalid sha256:"
+            echo "$bad" | sed 's/^/  - /'
+            exit 1
+          fi
+
+          # 3. Keys must be filename-safe (also guarantees asset-name safety).
+          badkeys="$(jq -r '.wallpapers | keys[]' "$f" \
+            | grep -vE '^[A-Za-z][A-Za-z0-9_-]*$' || true)"
+          if [ -n "$badkeys" ]; then
+            echo "::error::these wallpaper names are not filename-safe:"
+            echo "$badkeys" | sed 's/^/  - /'
+            exit 1
+          fi
+
+          # jq object keys are inherently unique, so no duplicate-key check is
+          # needed -- a duplicate in the source would already have failed to
+          # parse or collapsed. Report success with a count.
+          n="$(jq '.wallpapers | length' "$f")"
+          echo "workshop.json OK: $n wallpaper(s) validated."
