@@ -1,14 +1,14 @@
 name: validate-manifest
 
-# Validates workshop.json on pull requests and pushes to main. This is the only
-# thing CI can safely do here: the wallpaper videos come from the Steam Workshop
-# (a paid app behind Steam Guard), so CI cannot fetch or publish them -- that
-# step is done locally by a human (see scripts/fetch-wallpaper.sh and
-# scripts/publish-release.sh). CI just keeps the manifest honest.
+# Validates workshop.json on pull requests and pushes to main. The wallpaper
+# videos come from the Steam Workshop (a paid app behind Steam Guard), so CI on
+# GitHub-hosted runners cannot fetch or publish them. That work happens on a
+# self-hosted runner (see publish-wallpapers.yml) or locally. This job just
+# keeps the manifest honest so a bad entry is caught before publish.
 #
 # Checks:
 #   1. workshop.json is valid JSON with the expected top-level shape.
-#   2. Every wallpaper entry has a non-empty id, file, and 64-hex-char sha256.
+#   2. Every wallpaper entry has a non-empty id and a 64-hex-char sha256.
 #   3. Every wallpaper key (the clean name) is filename-safe and unique.
 
 on:
@@ -39,17 +39,16 @@ jobs:
                  and (.wallpapers | type == "object")' "$f" >/dev/null \
             || { echo "::error::$f is missing a top-level 'wallpapers' object"; exit 1; }
 
-          # 2. Each entry has id, file, and a valid sha256.
+          # 2. Each entry has an id and a valid sha256.
           bad="$(jq -r '
             .wallpapers | to_entries[]
             | select(
                 (.value.id // "" | length == 0)
-                or (.value.file // "" | length == 0)
                 or ((.value.sha256 // "") | test("^[0-9a-f]{64}$") | not)
               )
             | .key' "$f")"
           if [ -n "$bad" ]; then
-            echo "::error::these entries are missing id/file or have an invalid sha256:"
+            echo "::error::these entries are missing an id or have an invalid sha256:"
             echo "$bad" | sed 's/^/  - /'
             exit 1
           fi

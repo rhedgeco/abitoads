@@ -1,0 +1,48 @@
+name: publish-wallpapers
+
+# Downloads the manifest's wallpapers from the Steam Workshop and uploads any
+# that are missing from the single long-lived `wallpapers` release.
+#
+# This runs on a SELF-HOSTED runner (the maintainer's own server) because:
+#   - the videos come from Wallpaper Engine, a paid Steam app behind Steam Guard,
+#     so the download needs a logged-in Steam session, and
+#   - that Steam identity (and the gh credentials) must stay on the server, never
+#     in the repo or in GitHub-hosted secrets.
+#
+# SECURITY: this workflow must never run untrusted code on the self-hosted
+# runner. It is therefore restricted to `push` on `main` and manual
+# `workflow_dispatch` only -- never `pull_request` (which can come from forks).
+#
+# Runner prerequisites (one-time setup on the server, via `just init-runner`):
+#   - a GitHub Actions self-hosted runner registered to this repo, with the
+#     label `steam-publish` (see runs-on below).
+#   - devenv + nix available to the runner. The workflow runs everything through
+#     `devenv shell`, so devenv provides gh, steamcmd, just, python3 and
+#     secretspec; no other tools need to be installed on the server.
+#   - STEAM_USER and GH_TOKEN stored in secretspec (keyring provider) on the
+#     server. They are declared in secretspec.toml and injected into publish by
+#     `secretspec run`, so no secret values are written to disk or the repo.
+#     GH_TOKEN needs permission to edit releases on this repo.
+#   - a one-time interactive `steamcmd +login <STEAM_USER>` on the server to
+#     cache the Steam Guard sentry, so later CI logins are non-interactive.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "workshop.json"
+  workflow_dispatch: {}
+
+# Only one publish at a time; a newer push supersedes an in-flight run.
+concurrency:
+  group: publish-wallpapers
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: [self-hosted, steam-publish]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish wallpapers
+        run: devenv shell -- secretspec run -- just publish --download
