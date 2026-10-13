@@ -1,0 +1,24 @@
+{
+  "lsp": {
+    "ruff": {
+      "binary": { "path": "ruff", "arguments": ["server"] },
+    },
+    "basedpyright": {
+      "binary": {
+        "path": "basedpyright-langserver",
+        "arguments": ["--stdio"],
+      },
+    },
+  },
+  "languages": {
+    "Python": {
+      "language_servers": ["basedpyright", "ruff"],
+      "format_on_save": "on",
+      "code_actions_on_format": {
+        "source.fixAll.ruff": true,
+        "source.organizeImports.ruff": true,
+      },
+      "formatter": [{ "language_server": { "name": "ruff" } }],
+    },
+  },
+}

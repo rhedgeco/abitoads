@@ -1,15 +1,13 @@
 { pkgs, ... }: {
   packages = with pkgs; [
     just # task runner (justfile)
-    jq # manifest (workshop.json) manipulation
-    coreutils # sha256sum, stat, etc.
-    curl # steam-fetch.sh downloads steamcmd
-    gnused # name derivation in fetch-wallpaper.sh
-    gawk # name derivation in fetch-wallpaper.sh
-    gh # publish-release.sh uploads release assets
+    python3 # scripts/abitoads.py (fetch / publish / verify)
+    ruff # python linter + formatter (LSP: formatting, lint fixes)
+    basedpyright # python type checker + language server (hover, completion, go-to-def)
+    curl # general networking / steamcmd fallback
+    gh # abitoads.py publish uploads release assets
     git # version control
-    git-lfs # legacy; harmless to have around
-    git-filter-repo # purge-history.sh
-    steam-run # runs the unfree steamcmd on NixOS (steam-fetch.sh)
+    steamcmd # downloads workshop items (abitoads.py fetch)
+    steam-run # FHS wrapper steamcmd needs on NixOS
   ];
 }
