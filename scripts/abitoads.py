@@ -10,6 +10,8 @@ Subcommands:
     fetch  [--update]  download every manifest item and collect it into .wallpapers/
     verify            re-hash the collected .wallpapers/ files against the manifest
     publish  [--download]  download manifest items, cut a new release snapshot
+    runner            install, register, prime Steam login, and run the
+                      self-hosted GitHub Actions runner (maintainer's server)
 
 Design / model (see README, CONTRIBUTING):
     * workshop.json maps a clean, filename-safe NAME -> {id, sha256}.
@@ -37,11 +39,15 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.request
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -55,6 +61,12 @@ REPO = "rhedgeco/abitoads"
 # Each publish cuts a new snapshot release tagged v1, v2, ...; GitHub's
 # `releases/latest` pointer then tracks the newest by semver.
 RELEASE_TAG_PREFIX = "v"
+
+# self-hosted runner (see cmd_runner). Kept inside the repo (git-ignored) rather
+# than in $HOME so everything the runner needs lives alongside the project.
+RUNNER_LABEL = "steam-publish"
+RUNNER_DIR = Path(".runner")
+RUNNER_RELEASE_API = "https://api.github.com/repos/actions/runner/releases/latest"
 
 # asset paths
 MANIFEST = Path("workshop.json")
@@ -191,14 +203,16 @@ def require_secret(name: str) -> str:
 
 
 def ensure_github_auth() -> None:
-    """Ensure gh is available and has a token, resolved through secretspec.
+    """Ensure gh is available and authenticated.
 
-    gh reads GH_TOKEN from the environment, so exporting the resolved value is
-    enough to authenticate it.
+    gh reads GH_TOKEN from the environment. In CI the workflow already exports
+    it (the job's built-in GITHUB_TOKEN), so we use that as-is; locally we
+    resolve it through secretspec and export it.
     """
     if not is_on_path("gh"):
         die("gh is required but not found on PATH; enter the devenv shell first.")
-    os.environ["GH_TOKEN"] = require_secret("GH_TOKEN")
+    if not os.environ.get("GH_TOKEN"):
+        os.environ["GH_TOKEN"] = require_secret("GH_TOKEN")
 
 
 def load_manifest() -> dict:
@@ -676,6 +690,195 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# self-hosted runner
+#
+# Install, register, prime Steam, and run this server's GitHub Actions runner
+# for the publish-wallpapers workflow. Idempotent: run it as often as you like.
+#
+# NixOS note: the runner bundles a .NET runtime that dynamically links against
+# FHS system libraries (libstdc++, libicu, ...) which NixOS does not provide
+# globally, so ./config.sh and ./run.sh do not work directly -- every invocation
+# of the runner binary goes through steam-run (an FHS sandbox from the devenv).
+# --------------------------------------------------------------------------
+
+
+def prompt_tty(message: str) -> str:
+    """Prompt for a line of input.
+
+    Prefer /dev/tty so the prompt works even when stdin is redirected (e.g. the
+    register command reads piped ids), but fall back to stdin when no controlling
+    terminal is attached (e.g. run under `devenv shell --`).
+    """
+    try:
+        with open("/dev/tty", "r+") as terminal:
+            terminal.write(message)
+            terminal.flush()
+            return terminal.readline().strip()
+    except OSError:
+        pass
+    try:
+        return input(message).strip()
+    except EOFError:
+        die("no input available to answer the prompt.")
+
+
+def latest_runner_version() -> str:
+    """Resolve the newest actions/runner release (without the leading 'v').
+
+    GitHub enforces a minimum runner version, so we always track the latest
+    rather than pinning one that would eventually be rejected at registration.
+    Override via the RUNNER_VERSION environment variable.
+    """
+    override = os.environ.get("RUNNER_VERSION")
+    if override:
+        return override
+    step("Resolving the latest actions/runner release")
+    try:
+        with urllib.request.urlopen(RUNNER_RELEASE_API) as response:
+            release = json.load(response)
+    except (OSError, ValueError) as error:
+        die(f"failed to query the latest actions/runner release: {error}")
+    return str(release["tag_name"]).lstrip("v")
+
+
+def runner_arch() -> str:
+    machine = platform.machine()
+    if machine == "x86_64":
+        return "x64"
+    if machine in ("aarch64", "arm64"):
+        return "arm64"
+    die(f"unsupported CPU architecture: {machine}")
+
+
+def install_runner(version: str) -> None:
+    """Download and extract the runner, unless that version is already present.
+
+    A stamp file records the installed version so a bump (or GitHub raising its
+    minimum) re-installs over the stale runner.
+    """
+    stamp = RUNNER_DIR / ".installed-version"
+    already_installed = (
+        (RUNNER_DIR / "run.sh").exists()
+        and stamp.exists()
+        and stamp.read_text().strip() == version
+    )
+    if already_installed:
+        info(f"runner {version} already installed")
+        return
+
+    arch = runner_arch()
+    tarball = f"actions-runner-linux-{arch}-{version}.tar.gz"
+    url = f"https://github.com/actions/runner/releases/download/v{version}/{tarball}"
+    step(f"Downloading runner {paint(version, Style.BOLD)} ({arch})")
+    archive = RUNNER_DIR / tarball
+    try:
+        urllib.request.urlretrieve(url, archive)
+        with tarfile.open(archive) as tar:
+            tar.extractall(RUNNER_DIR)
+    except (OSError, tarfile.TarError) as error:
+        die(f"failed to download or extract the runner: {error}")
+    finally:
+        archive.unlink(missing_ok=True)
+    stamp.write_text(f"{version}\n")
+
+
+def configure_runner() -> None:
+    """Register the runner, but only if it is not already configured.
+
+    The .runner file records an existing registration; re-running configure on
+    top of it fails. To re-register (new repo, lost registration), delete the
+    runner dir and run again.
+    """
+    if (RUNNER_DIR / ".runner").exists():
+        info("runner already configured")
+        return
+
+    # A registration token is short-lived; get one from:
+    #   GitHub -> repo Settings -> Actions -> Runners -> New self-hosted runner
+    token = os.environ.get("RUNNER_TOKEN") or prompt_tty(
+        "Runner registration token (repo Settings -> Actions -> Runners): "
+    )
+    if not token:
+        die("a runner registration token is required.")
+
+    # Configure via the listener binary directly, under steam-run: ./config.sh's
+    # ldd dependency precheck runs outside the FHS sandbox and wrongly reports
+    # the bundled .NET libraries as missing on NixOS.
+    step("Registering runner")
+    subprocess.run(
+        [
+            "steam-run",
+            "./bin/Runner.Listener",
+            "configure",
+            "--unattended",
+            "--url",
+            f"https://github.com/{REPO}",
+            "--token",
+            token,
+            "--name",
+            f"{socket.gethostname()}-abitoads",
+            "--labels",
+            RUNNER_LABEL,
+            "--replace",
+        ],
+        cwd=RUNNER_DIR,
+        check=True,
+    )
+
+
+def prime_steam_login(user: str) -> None:
+    """Prime the Steam session so CI jobs never block on a Steam Guard prompt.
+
+    steamcmd caches a sentry after the first confirmed login; doing it here (with
+    the maintainer's confirmation) makes later non-interactive logins silent.
+    Skip with RUNNER_SKIP_STEAM_LOGIN=1 once the session is primed.
+    """
+    if os.environ.get("RUNNER_SKIP_STEAM_LOGIN"):
+        return
+    reply = prompt_tty(
+        f"\nPrime the Steam session for {user} now? "
+        "You may be prompted for your\npassword and Steam Guard code. [Y/n] "
+    )
+    if reply.lower() in ("n", "no"):
+        warn("skipping Steam login; make sure the session is already primed.")
+        return
+    step(f"Logging in to Steam as {paint(user, Style.BOLD)}")
+    result = subprocess.run(["steamcmd", "+login", user, "+quit"], check=False)
+    if result.returncode != 0:
+        die("Steam login failed; fix it and re-run, or set RUNNER_SKIP_STEAM_LOGIN=1.")
+
+
+def cmd_runner(args: argparse.Namespace) -> int:
+    del args
+    if not is_on_path("steam-run"):
+        die("steam-run not found on PATH; run this through the devenv (just runner).")
+
+    user = resolve_steam_user()
+
+    header("Self-hosted runner")
+    RUNNER_DIR.mkdir(parents=True, exist_ok=True)
+
+    install_runner(latest_runner_version())
+    configure_runner()
+
+    # The runner reads this .env in its install dir and injects the variable into
+    # every job's environment, where the publish step (SECRETSPEC_PROVIDER=env)
+    # resolves it via the secretspec env provider.
+    (RUNNER_DIR / ".env").write_text(f"STEAM_USER={user}\n")
+
+    prime_steam_login(user)
+
+    # Run the runner under steam-run (for the FHS libraries); the surrounding
+    # devenv environment gives the publish job gh, steamcmd, just, etc. This
+    # blocks until the runner exits -- wrap `just runner` in your own supervisor
+    # (systemd unit, tmux, ...) to survive logout or restart on crash.
+    header(f"Starting runner ({RUNNER_LABEL})")
+    info("ctrl-c to stop")
+    os.chdir(RUNNER_DIR)
+    os.execvp("steam-run", ["steam-run", "./run.sh"])
+
+
+# --------------------------------------------------------------------------
 # cli
 # --------------------------------------------------------------------------
 
@@ -715,6 +918,12 @@ def build_parser() -> argparse.ArgumentParser:
         "verify", help="re-hash the collected .wallpapers/ files against the manifest"
     )
     verify_parser.set_defaults(func=cmd_verify)
+
+    runner_parser = subparsers.add_parser(
+        "runner",
+        help="install, register, prime Steam login, and run the self-hosted runner",
+    )
+    runner_parser.set_defaults(func=cmd_runner)
 
     return parser
 

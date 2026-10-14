@@ -26,6 +26,6 @@ verify:
 publish *args:
     python3 scripts/abitoads.py publish {{ args }}
 
-# one-time: registers this server as the self-hosted runner for publish-wallpapers (prompts for a runner token and Steam username)
-init-runner:
-    ./scripts/init-runner.sh
+# installs, registers (first run only), primes Steam login and runs this server's self-hosted runner for publish-wallpapers (idempotent; ctrl-c to stop)
+runner:
+    ./scripts/runner.sh

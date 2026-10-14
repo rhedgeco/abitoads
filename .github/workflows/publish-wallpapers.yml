@@ -14,18 +14,18 @@ name: publish-wallpapers
 # runner. It is therefore restricted to `push` on `main` and manual
 # `workflow_dispatch` only -- never `pull_request` (which can come from forks).
 #
-# Runner prerequisites (one-time setup on the server, via `just init-runner`):
+# Runner prerequisites (set up and run on the server via `just runner`):
 #   - a GitHub Actions self-hosted runner registered to this repo, with the
 #     label `steam-publish` (see runs-on below).
 #   - devenv + nix available to the runner. The workflow runs everything through
 #     `devenv shell`, so devenv provides gh, steamcmd, just, python3 and
 #     secretspec; no other tools need to be installed on the server.
-#   - STEAM_USER and GH_TOKEN set in the runner's environment (init-runner writes
-#     them to the runner's .env, which the runner injects into every job). The
-#     publish step sets SECRETSPEC_PROVIDER=env so the tool's secretspec SDK
-#     resolves both secrets straight from that environment in-process (the tool
-#     errors if either is unset). GH_TOKEN needs permission to edit releases on
-#     this repo.
+#   - STEAM_USER set in the runner's environment (`just runner` writes it to the
+#     runner's .env, which the runner injects into every job). The publish step
+#     sets SECRETSPEC_PROVIDER=env so the tool's secretspec SDK resolves it
+#     straight from that environment in-process (the tool errors if it is unset).
+#   - gh uses the job's built-in GITHUB_TOKEN to edit releases (exposed to the
+#     step as GH_TOKEN below); no personal token is needed on the runner.
 #   - a one-time interactive `steamcmd +login <STEAM_USER>` on the server to
 #     cache the Steam Guard sentry, so later CI logins are non-interactive.
 
@@ -41,16 +41,30 @@ concurrency:
   group: publish-wallpapers
   cancel-in-progress: false
 
+# gh needs to create releases, so grant the job's GITHUB_TOKEN write access.
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: [self-hosted, steam-publish]
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check token
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "GH_TOKEN length: ${#GH_TOKEN}"
+          test -n "$GH_TOKEN" && echo "token present" || echo "token EMPTY"
+
       - name: Publish wallpapers
         env:
-          # Resolve STEAM_USER and GH_TOKEN (present in the runner's job
-          # environment, from its .env) via the secretspec env provider, which
-          # the tool's SDK reads in-process. No secrets are defined here.
+          # gh reads GH_TOKEN straight from the environment; the job's built-in
+          # GITHUB_TOKEN (contents:write, granted above) is enough to cut the
+          # release, so no personal token is needed here.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # STEAM_USER lives in the runner's own environment (from its .env);
+          # the secretspec env provider resolves it in-process for the download.
           SECRETSPEC_PROVIDER: env
         run: devenv shell -- just publish --download

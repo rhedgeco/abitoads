@@ -5,6 +5,9 @@
 # Clean collection of videos named by their manifest names (just fetch).
 /.wallpapers/
 
+# Self-hosted GitHub Actions runner install (just runner).
+/.runner/
+
 # Python bytecode cache
 __pycache__/
 *.pyc
