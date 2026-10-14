@@ -40,27 +40,49 @@ listed in [`workshop.json`](./workshop.json).
 
 ### Using the wallpapers from Nix
 
-Read the manifest and `fetchurl` each wallpaper by name, pinned by `sha256`:
+The repo is a flake. Each wallpaper is a `pkgs.fetchurl` derivation (pinned by
+`sha256`), so builds are substitutable from binary caches, run on remote
+builders, and download nothing at eval time. The outputs live under the standard
+per-system `packages.<system>` attribute:
 
 ```nix
-let
-  manifest = builtins.fromJSON (builtins.readFile ./workshop.json);
-  baseUrl = "https://github.com/rhedgeco/abitoads/releases/latest/download";
-in
-  builtins.mapAttrs
-    (name: w: pkgs.fetchurl {
-      url = "${baseUrl}/${name}.mp4";
-      sha256 = w.sha256;
-    })
-    manifest.wallpapers
+{
+  inputs.abitoads.url = "github:rhedgeco/abitoads";
+
+  outputs = { self, nixpkgs, abitoads }:
+    let system = "x86_64-linux"; in {
+      # one wallpaper (a <Name>.mp4 derivation)
+      #   abitoads.packages.${system}.LazyRiver
+      # a directory of every <Name>.mp4
+      #   abitoads.packages.${system}.all
+    };
+}
 ```
 
-This gives you an attrset of `name -> derivation`, so you can pull just the
-wallpapers you want. Pin reproducibly by pairing a revision of `workshop.json`
-with the matching release: the `sha256` in a given commit of the manifest
-corresponds to the bytes in the release cut from it. For a frozen URL, replace
-`latest` with that release's tag (e.g. `v3`). To update, bump the pinned
-revision/tag together.
+From the CLI the same outputs build directly, with your current system filled in
+automatically:
+
+```
+nix build github:rhedgeco/abitoads#LazyRiver   # individual file
+nix build github:rhedgeco/abitoads#all         # directory of every <Name>.mp4
+```
+
+`all` is also the default package (`nix build github:rhedgeco/abitoads`).
+
+If you already have a `pkgs` in scope and would rather not index by system, use
+the overridable `fetchWallpapers` helper. It is just `import ./.`, so it also
+lets you pin a release tag or supply your own manifest:
+
+```nix
+abitoads.fetchWallpapers { inherit pkgs; tag = "v3"; }
+# => { wallpapers = { LazyRiver = <drv>; ... }; all = <drv>; }
+```
+
+By default the assets come from the mutable `latest` release. The content is
+hash-pinned so it is reproducible, but the `latest` URL can 404 once the set
+changes, so pin a snapshot tag (e.g. `v3`) for a frozen reference. Non-flake
+users can `import` [`default.nix`](./default.nix) directly with the same
+arguments (`pkgs`, `owner`, `repo`, `tag`, `manifest`).
 
 ## Maintaining the collection
 
