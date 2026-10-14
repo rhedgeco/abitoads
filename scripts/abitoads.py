@@ -47,6 +47,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from enum import Enum
 from functools import lru_cache
@@ -61,6 +62,10 @@ REPO = "rhedgeco/abitoads"
 # Each publish cuts a new snapshot release tagged v1, v2, ...; GitHub's
 # `releases/latest` pointer then tracks the newest by semver.
 RELEASE_TAG_PREFIX = "v"
+# Large asset uploads to GitHub occasionally time out (HTTP 408/5xx); retry each
+# upload a few times with backoff before giving up.
+UPLOAD_ATTEMPTS = 4
+UPLOAD_BACKOFF_SECONDS = 5
 
 # self-hosted runner (see cmd_runner). Kept inside the repo (git-ignored) rather
 # than in $HOME so everything the runner needs lives alongside the project.
@@ -554,6 +559,95 @@ def next_release_tag(repo: str) -> str:
     return f"{RELEASE_TAG_PREFIX}{candidate}"
 
 
+RELEASE_NOTES = (
+    "Abi Toads wallpapers, sourced from the Steam Workshop. A snapshot of the "
+    "full current set; assets are named <Name>.mp4. See workshop.json for the "
+    "sha256-pinned manifest. Consumers can pull the current set from "
+    "releases/latest/download/<Name>.mp4."
+)
+
+
+def create_empty_release(repo: str, tag: str) -> None:
+    """Create the snapshot release with no assets yet.
+
+    Assets are uploaded afterwards, one at a time with retries, so a single
+    flaky upload does not abandon the whole batch. Never overwrites an existing
+    release/tag -- that is prevented upstream by next_release_tag.
+    """
+    created = subprocess.run(
+        [
+            "gh",
+            "release",
+            "create",
+            tag,
+            "--repo",
+            repo,
+            "--latest",
+            "--title",
+            f"Abi Toads wallpapers {tag}",
+            "--notes",
+            RELEASE_NOTES,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        detail = created.stderr.strip()
+        if "already exists" in detail.lower():
+            die(
+                f"release tag {tag} already exists; not overwriting it. "
+                "Re-run publish to pick the next free tag."
+            )
+        die(f"failed to create release {tag}:\n{detail}")
+
+
+def delete_release(repo: str, tag: str) -> None:
+    """Remove a release and its tag (used to clean up a failed partial upload)."""
+    subprocess.run(
+        ["gh", "release", "delete", tag, "--repo", repo, "--cleanup-tag", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def upload_asset(repo: str, tag: str, asset: Path) -> bool:
+    """Upload one asset to the release, retrying transient failures.
+
+    Returns True on success. Large uploads intermittently fail with HTTP
+    408/5xx; we retry with backoff. --clobber lets a retry replace a partial
+    upload of the SAME asset on the SAME fresh release (not an overwrite of a
+    previously published release, which never happens because the tag is new).
+    """
+    for attempt in range(1, UPLOAD_ATTEMPTS + 1):
+        result = subprocess.run(
+            [
+                "gh",
+                "release",
+                "upload",
+                tag,
+                str(asset),
+                "--repo",
+                repo,
+                "--clobber",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return True
+        detail = result.stderr.strip().splitlines()
+        reason = detail[-1] if detail else "unknown error"
+        if attempt < UPLOAD_ATTEMPTS:
+            warn(f"upload of {asset.name} failed ({reason}); retrying")
+            time.sleep(UPLOAD_BACKOFF_SECONDS * attempt)
+        else:
+            warn(f"upload of {asset.name} failed ({reason}); giving up")
+    return False
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     data = load_manifest()
     wallpapers = data["wallpapers"]
@@ -687,42 +781,28 @@ def cmd_publish(args: argparse.Namespace) -> int:
         count = paint(str(len(to_upload)), Style.BOLD)
         tag_label = paint(tag, Style.BOLD)
         step(f"Creating {tag_label}, uploading {count} asset(s){Glyph.ELLIPSIS}")
-        created = subprocess.run(
-            [
-                "gh",
-                "release",
-                "create",
-                tag,
-                *map(str, to_upload),
-                "--repo",
-                repo,
-                "--latest",
-                "--title",
-                f"Abi Toads wallpapers {tag}",
-                "--notes",
-                (
-                    "Abi Toads wallpapers, sourced from the Steam Workshop. A "
-                    "snapshot of the full current set; assets are named "
-                    "<Name>.mp4. See workshop.json for the sha256-pinned "
-                    "manifest. Consumers can pull the current set from "
-                    "releases/latest/download/<Name>.mp4."
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if created.returncode != 0:
-            detail = created.stderr.strip()
-            # Never overwrite an existing release/tag. If the tag got taken
-            # between selection and creation, fail loudly so a re-run picks the
-            # next free tag instead of clobbering what is already published.
-            if "already exists" in detail.lower():
-                die(
-                    f"release tag {tag} already exists; not overwriting it. "
-                    "Re-run publish to pick the next free tag."
-                )
-            die(f"failed to create release {tag}:\n{detail}")
+
+        # Create the release empty, then upload assets one at a time with
+        # retries. A single flaky upload (GitHub occasionally times out on large
+        # files) no longer abandons the batch; and if an asset ultimately
+        # fails, we delete this just-created release so no broken partial
+        # snapshot is left behind for consumers.
+        create_empty_release(repo, tag)
+        failed: list[str] = []
+        for asset_path in to_upload:
+            if upload_asset(repo, tag, asset_path):
+                ok(f"uploaded {paint(asset_path.name, Style.BOLD)}")
+            else:
+                failed.append(asset_path.name)
+
+        if failed:
+            step(f"Cleaning up incomplete release {tag_label}{Glyph.ELLIPSIS}")
+            delete_release(repo, tag)
+            die(
+                f"failed to upload {len(failed)} asset(s) to {tag}: "
+                f"{', '.join(failed)}.\nThe incomplete release was deleted; "
+                "re-run publish to try again."
+            )
 
     header("Done")
     count = paint(str(len(to_upload)), Style.BOLD)
