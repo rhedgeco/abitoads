@@ -582,7 +582,7 @@ def create_empty_release(repo: str, tag: str) -> None:
             repo,
             "--latest",
             "--title",
-            f"Wallpaper Release {tag}",
+            f"Wallpapers {tag}",
             "--notes",
             RELEASE_NOTES,
         ],
