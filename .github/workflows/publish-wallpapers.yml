@@ -51,13 +51,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check token
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "GH_TOKEN length: ${#GH_TOKEN}"
-          test -n "$GH_TOKEN" && echo "token present" || echo "token EMPTY"
-
       - name: Publish wallpapers
         env:
           # gh reads GH_TOKEN straight from the environment; the job's built-in

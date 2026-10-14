@@ -497,8 +497,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
-def next_release_tag(repo: str) -> str:
-    """The next snapshot tag: one past the highest existing vN (v1 if none)."""
+def existing_release_tags(repo: str) -> set[str]:
+    """All tags that already have a GitHub release."""
     result = subprocess.run(
         [
             "gh",
@@ -515,13 +515,43 @@ def next_release_tag(repo: str) -> str:
         text=True,
         check=False,
     )
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def existing_git_tags(repo: str) -> set[str]:
+    """All git tags on the remote repo (releases can sit on tags with no release,
+    and a dangling tag from a half-failed run must not be silently reused)."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/{repo}/tags", "--jq", ".[].name", "--paginate"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def next_release_tag(repo: str) -> str:
+    """The next free snapshot tag (v1, v2, ...).
+
+    One past the highest existing vN, but also skipping any tag that is already
+    taken -- by a release OR by a dangling git tag -- so a retried or
+    half-failed run never reuses, overwrites, or clobbers an existing one.
+    """
+    taken = existing_release_tags(repo) | existing_git_tags(repo)
     highest = 0
-    if result.returncode == 0:
-        for line in result.stdout.splitlines():
-            match = re.fullmatch(rf"{re.escape(RELEASE_TAG_PREFIX)}(\d+)", line.strip())
-            if match:
-                highest = max(highest, int(match.group(1)))
-    return f"{RELEASE_TAG_PREFIX}{highest + 1}"
+    for tag in taken:
+        match = re.fullmatch(rf"{re.escape(RELEASE_TAG_PREFIX)}(\d+)", tag)
+        if match:
+            highest = max(highest, int(match.group(1)))
+    # Advance past the highest known number, then keep going until genuinely free.
+    candidate = highest + 1
+    while f"{RELEASE_TAG_PREFIX}{candidate}" in taken:
+        candidate += 1
+    return f"{RELEASE_TAG_PREFIX}{candidate}"
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -610,7 +640,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
                 mismatched.append((name, entry["sha256"], actual))
                 continue
             link = staging / asset
-            link.symlink_to(video_path)
+            # gh resolves asset paths from its own CWD, and video_path is
+            # relative to the repo root; make the symlink target absolute so it
+            # is valid from the staging dir in /tmp.
+            link.symlink_to(video_path.resolve())
             to_upload.append(link)
             step(f"queued {paint(asset, Style.BOLD)}")
 
@@ -680,7 +713,16 @@ def cmd_publish(args: argparse.Namespace) -> int:
             check=False,
         )
         if created.returncode != 0:
-            die(f"failed to create release {tag}:\n{created.stderr.strip()}")
+            detail = created.stderr.strip()
+            # Never overwrite an existing release/tag. If the tag got taken
+            # between selection and creation, fail loudly so a re-run picks the
+            # next free tag instead of clobbering what is already published.
+            if "already exists" in detail.lower():
+                die(
+                    f"release tag {tag} already exists; not overwriting it. "
+                    "Re-run publish to pick the next free tag."
+                )
+            die(f"failed to create release {tag}:\n{detail}")
 
     header("Done")
     count = paint(str(len(to_upload)), Style.BOLD)
