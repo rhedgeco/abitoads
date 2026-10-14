@@ -4,3 +4,7 @@ inputs:
 
 # steamcmd/steam-run is unfree. Allow it so the dev shell can include it.
 allowUnfree: true
+
+# silence the "integration is not enabled" notice on every shell
+secretspec:
+  enable: false

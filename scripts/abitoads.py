@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """Abi Toads wallpaper tooling.
 
-A small, stdlib-only CLI for managing the Steam Workshop -> GitHub release
-pipeline for Abi Toads animated wallpapers.
+A small CLI for managing the Steam Workshop -> GitHub release pipeline for Abi
+Toads animated wallpapers. It uses only the Python standard library plus the
+secretspec SDK (provided by the devenv) to resolve credentials.
 
 Subcommands:
-    fetch    <user> <id>...   download item(s), hash, name, record in manifest
-    publish  [--download [user]]  download manifest items, upload missing assets
-    verify                    re-hash locally-downloaded files against manifest
+    register <id>...  download item(s), hash, name, record in the manifest
+    fetch  [--update]  download every manifest item and collect it into .wallpapers/
+    verify            re-hash the collected .wallpapers/ files against the manifest
+    publish  [--download]  download manifest items, cut a new release snapshot
 
 Design / model (see README, CONTRIBUTING):
     * workshop.json maps a clean, filename-safe NAME -> {id, sha256}.
-    * NAME is the identity: it is the manifest key, the release asset name
-      ("<Name>.mp4"), and the on-disk name. Names are WRITE-ONCE / immutable.
-    * When a wallpaper's content changes, it is recorded under a NEW name
-      (collision -> append V2, V3, ...); the old entry is frozen forever.
+    * NAME is stable: it is the manifest key, the release asset name
+      ("<Name>.mp4"), and the on-disk name. When a wallpaper's content changes,
+      its entry keeps the same NAME and its sha256 is updated in place (keyed by
+      the Workshop id, which is stable across versions).
+    * Each publish cuts a NEW release tag (v1, v2, ...) holding the full current
+      set, so GitHub's `releases/latest` always points at the current snapshot.
+      Consumers fetch `releases/latest/download/<Name>.mp4`.
     * The original Workshop filename is NOT stored -- it is read from each
       item's project.json when needed. No URL is stored; consumers build it.
 
-The videos come from Wallpaper Engine (paid app, Steam Guard), so `fetch`
-is interactive and local. `publish` can run anywhere with a usable Steam
-session (e.g. a self-hosted CI runner); with --download it downloads from
-Steam first, using the username passed to --download or, if omitted,
-$STEAM_USER. Before uploading, publish re-hashes each local file
-against the committed sha256 and aborts on any mismatch.
+The videos come from Wallpaper Engine (paid app, Steam Guard). Steam and GitHub
+credentials (STEAM_USER, GH_TOKEN) are resolved through secretspec, which each
+environment provisions however it likes (see secretspec.toml). `register` is
+interactive (name prompt + Steam Guard); `fetch`/`publish` are not. Before
+uploading, publish re-hashes each local file against the committed sha256 and
+aborts on any mismatch.
 """
 
 from __future__ import annotations
@@ -38,18 +43,28 @@ import subprocess
 import sys
 import tempfile
 from enum import Enum
+from functools import lru_cache
 from pathlib import Path
 from typing import NoReturn
+
+from secretspec import SecretSpec, SecretSpecError
 
 # workshop and repo ids
 APP_ID = "431960"
 REPO = "rhedgeco/abitoads"
-RELEASE_TAG = "wallpapers"
+# Each publish cuts a new snapshot release tagged v1, v2, ...; GitHub's
+# `releases/latest` pointer then tracks the newest by semver.
+RELEASE_TAG_PREFIX = "v"
 
 # asset paths
 MANIFEST = Path("workshop.json")
-STEAM_WORK = Path(".steam-fetch")
+# steamcmd's download cache (raw, nested by workshop id); git-ignored.
+STEAM_WORK = Path(".steam")
 CONTENT_DIR = STEAM_WORK / "out" / "steamapps" / "workshop" / "content" / APP_ID
+# A clean, flat collection of the videos named by their manifest names; the
+# steam cache above is where they are downloaded, this is where they are copied
+# for convenient local use. git-ignored.
+COLLECTED_DIR = Path(".wallpapers")
 
 # video filename validator
 VALID_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
@@ -146,21 +161,44 @@ def is_on_path(command: str) -> bool:
     return shutil.which(command) is not None
 
 
+# --------------------------------------------------------------------------
+# secrets (resolved through secretspec; each environment provisions the
+# provider, see secretspec.toml)
+# --------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def load_secrets() -> dict[str, str]:
+    """Resolve the declared secrets via secretspec, cached for the process.
+
+    The secrets are declared optional in secretspec.toml so resolution never
+    fails just because one is absent; each command enforces only the secret it
+    actually needs via require_secret(). The provider (env, dotenv, keyring,
+    ...) is chosen by the environment, not here.
+    """
+    try:
+        resolved = SecretSpec.builder().with_reason("abitoads wallpaper tooling").load()
+    except SecretSpecError as error:
+        die(f"could not resolve secrets via secretspec: {error}")
+    return {name: (secret.get or "") for name, secret in resolved.secrets.items()}
+
+
+def require_secret(name: str) -> str:
+    value = load_secrets().get(name)
+    if not value:
+        die(f"{name} is not set; provision it via secretspec (see secretspec.toml).")
+    return value
+
+
 def ensure_github_auth() -> None:
-    """Fail early with a friendly message if gh has no usable credentials."""
+    """Ensure gh is available and has a token, resolved through secretspec.
+
+    gh reads GH_TOKEN from the environment, so exporting the resolved value is
+    enough to authenticate it.
+    """
     if not is_on_path("gh"):
         die("gh is required but not found on PATH; enter the devenv shell first.")
-    result = subprocess.run(
-        ["gh", "auth", "status"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        die(
-            "gh is not authenticated.\n"
-            "       run 'gh auth login' or set $GH_TOKEN to a GitHub token."
-        )
+    os.environ["GH_TOKEN"] = require_secret("GH_TOKEN")
 
 
 def load_manifest() -> dict:
@@ -218,18 +256,32 @@ def item_video_path(workshop_id: str) -> Path | None:
     return video_path if video_path.is_file() else None
 
 
+def collect_video(name: str, video_path: Path) -> Path:
+    """Copy a downloaded video into COLLECTED_DIR as '<name>.mp4'.
+
+    This gives a clean, flat folder of the videos named by their manifest
+    names, separate from steamcmd's nested download cache. Copies only when the
+    destination is missing or differs, so re-runs are cheap.
+    """
+    COLLECTED_DIR.mkdir(parents=True, exist_ok=True)
+    destination = COLLECTED_DIR / f"{name}.mp4"
+    if (
+        destination.is_file()
+        and destination.stat().st_size == video_path.stat().st_size
+    ):
+        return destination
+    shutil.copyfile(video_path, destination)
+    return destination
+
+
 # --------------------------------------------------------------------------
 # steam
 # --------------------------------------------------------------------------
 
 
-def resolve_steam_user(override: str | None = None) -> str:
-    if override:
-        return override
-    env = os.environ.get("STEAM_USER")
-    if env:
-        return env
-    die("no Steam username: pass it to --download or set $STEAM_USER")
+def resolve_steam_user() -> str:
+    """The Steam username, resolved through secretspec."""
+    return require_secret("STEAM_USER")
 
 
 def steam_download(user: str, ids: list[str]) -> None:
@@ -242,7 +294,10 @@ def steam_download(user: str, ids: list[str]) -> None:
     if not is_on_path("steamcmd"):
         die("steamcmd not found on PATH; enter the devenv shell first.")
 
-    output_dir = STEAM_WORK / "out"
+    # steamcmd resolves a relative +force_install_dir against its own install
+    # location, not the current working directory, so pass an absolute path to
+    # keep downloads inside this repo's STEAM_WORK where the tooling finds them.
+    output_dir = (STEAM_WORK / "out").resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     command = ["steamcmd", "+force_install_dir", str(output_dir), "+login", user]
@@ -276,16 +331,6 @@ def suggest_name(title: str) -> str:
     return "".join(word[:1].upper() + word[1:].lower() for word in words if word)
 
 
-def free_name(base: str, wallpapers: dict) -> str:
-    """First non-colliding variant: base, then baseV2, baseV3, ..."""
-    if base not in wallpapers:
-        return base
-    version = 2
-    while f"{base}V{version}" in wallpapers:
-        version += 1
-    return f"{base}V{version}"
-
-
 def prompt_name(suggestion: str, wallpapers: dict) -> str:
     while True:
         hint = f" {paint(f'[{suggestion}]', Style.DIM)}" if suggestion else ""
@@ -315,8 +360,8 @@ def prompt_name(suggestion: str, wallpapers: dict) -> str:
 # --------------------------------------------------------------------------
 
 
-def cmd_fetch(args: argparse.Namespace) -> int:
-    user = args.user
+def cmd_register(args: argparse.Namespace) -> int:
+    user = resolve_steam_user()
     ids = args.ids
 
     steam_download(user, ids)
@@ -324,8 +369,8 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     data = load_manifest()
     wallpapers = data["wallpapers"]
 
-    header("Recording wallpapers")
-    added = 0
+    header("Registering wallpapers")
+    changed = 0
     for workshop_id in ids:
         project = read_project(workshop_id)
         if not project:
@@ -340,182 +385,129 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         filename = project.get("file", "")
         sha256 = sha256_file(video_path)
 
-        # Already recorded with this exact content? no-op.
-        existing = next(
+        # An id is the stable identity of a wallpaper across content updates.
+        existing_name = next(
             (
                 name
                 for name, entry in wallpapers.items()
-                if entry.get("id") == workshop_id and entry.get("sha256") == sha256
+                if entry.get("id") == workshop_id
             ),
             None,
         )
-        if existing:
-            unchanged = paint("(unchanged)", Style.DIM)
-            ok(
-                f"[{workshop_id}] already recorded as "
-                f"{paint(existing, Style.BOLD)} {unchanged}"
-            )
-            continue
 
-        prior_names = [
-            name for name, entry in wallpapers.items() if entry.get("id") == workshop_id
-        ]
-
-        print()
         label = paint(f"[{workshop_id}]", Style.DIM)
         heading = paint(title, Style.BOLD)
         source = paint(f"({filename})", Style.DIM)
-        if not prior_names:
-            step(f"New wallpaper {label} {heading} {source}")
-        else:
+
+        if existing_name is not None:
+            if wallpapers[existing_name].get("sha256") == sha256:
+                collect_video(existing_name, video_path)
+                unchanged = paint("(unchanged)", Style.DIM)
+                ok(f"[{workshop_id}] {paint(existing_name, Style.BOLD)} {unchanged}")
+                continue
+            # Same wallpaper, new content: update its hash in place, keep name.
+            print()
             step(f"Updated wallpaper {label} {heading} {source}")
-            info("content changed; existing name(s) are kept frozen:")
-            for prior_name in prior_names:
-                info(f"  - {prior_name}")
-            info("choose a NEW name for this version.")
+            wallpapers[existing_name]["sha256"] = sha256
+            save_manifest(data)
+            collect_video(existing_name, video_path)
+            changed += 1
+            asset = paint(f"{Glyph.ARROW} {existing_name}.mp4", Style.DIM)
+            ok(f"updated {paint(existing_name, Style.BOLD)} {asset}")
+            continue
 
-        suggestion = free_name(suggest_name(title), wallpapers)
-        name = prompt_name(suggestion, wallpapers)
-
+        # Brand-new wallpaper: name it once.
+        print()
+        step(f"New wallpaper {label} {heading} {source}")
+        name = prompt_name(suggest_name(title), wallpapers)
         wallpapers[name] = {"id": workshop_id, "sha256": sha256}
         save_manifest(data)
-        added += 1
+        collect_video(name, video_path)
+        changed += 1
         asset = paint(f"{Glyph.ARROW} {name}.mp4", Style.DIM)
-        ok(f"added {paint(name, Style.BOLD)} {asset}")
+        ok(f"registered {paint(name, Style.BOLD)} {asset}")
 
     header("Done")
     where = paint(str(MANIFEST), Style.DIM)
-    ok(f"{paint(str(added), Style.BOLD)} added, manifest at {where}")
+    collected = paint(str(COLLECTED_DIR), Style.DIM)
+    ok(f"{paint(str(changed), Style.BOLD)} added/updated, manifest at {where}")
+    info(f"videos collected in {collected}")
     return 0
 
 
-def github_asset_names(repo: str, tag: str) -> set[str]:
+def cmd_fetch(args: argparse.Namespace) -> int:
+    user = resolve_steam_user()
+
+    data = load_manifest()
+    wallpapers = data["wallpapers"]
+    if not wallpapers:
+        die(f"{MANIFEST} has no wallpapers; run 'register' first.")
+
+    ids = sorted({entry["id"] for entry in wallpapers.values()})
+    steam_download(user, ids)
+
+    header("Collecting videos")
+    collected = 0
+    updated = 0
+    for name, entry in wallpapers.items():
+        video_path = item_video_path(entry["id"])
+        if not video_path:
+            die(f"[{name}] video not found after download for id {entry['id']}.")
+        actual = sha256_file(video_path)
+        if actual != entry["sha256"]:
+            if args.update:
+                # Refresh the manifest to match the freshly-downloaded content.
+                entry["sha256"] = actual
+                save_manifest(data)
+                updated += 1
+                collect_video(name, video_path)
+                ok(f"{name}.mp4 {paint('(sha256 updated)', Style.YELLOW)}")
+                collected += 1
+                continue
+            die(
+                f"[{name}] sha256 mismatch after download.\n"
+                f"       manifest: {entry['sha256']}\n"
+                f"       actual:   {actual}\n"
+                f"       (pass --update to refresh the manifest to match)"
+            )
+        collect_video(name, video_path)
+        ok(f"{name}.mp4")
+        collected += 1
+
+    header("Done")
+    where = paint(str(COLLECTED_DIR), Style.DIM)
+    ok(f"{paint(str(collected), Style.BOLD)} wallpaper(s) collected in {where}")
+    if updated:
+        manifest_path = paint(str(MANIFEST), Style.DIM)
+        info(f"{updated} sha256(s) updated in {manifest_path}")
+    return 0
+
+
+def next_release_tag(repo: str) -> str:
+    """The next snapshot tag: one past the highest existing vN (v1 if none)."""
     result = subprocess.run(
         [
             "gh",
             "release",
-            "view",
-            tag,
+            "list",
             "--repo",
             repo,
             "--json",
-            "assets",
+            "tagName",
             "--jq",
-            ".assets[].name",
+            ".[].tagName",
         ],
         capture_output=True,
         text=True,
         check=False,
     )
-    if result.returncode != 0:
-        return set()
-    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
-
-
-def cmd_publish(args: argparse.Namespace) -> int:
-    repo = REPO
-    tag = RELEASE_TAG
-
-    ensure_github_auth()
-
-    data = load_manifest()
-    wallpapers = data["wallpapers"]
-    if not wallpapers:
-        die(f"{MANIFEST} has no wallpapers; run 'fetch' first.")
-
-    # Ensure every item is downloaded locally (CI re-downloads from Steam).
-    if args.download is not None:
-        user = resolve_steam_user(args.download or None)
-        ids = sorted({entry["id"] for entry in wallpapers.values()})
-        steam_download(user, ids)
-
-    # Ensure the single release exists.
-    header(f"Publishing to {repo}")
-    step(f"Ensuring release {paint(tag, Style.BOLD)} exists{Glyph.ELLIPSIS}")
-    exists = (
-        subprocess.run(
-            ["gh", "release", "view", tag, "--repo", repo],
-            capture_output=True,
-            check=False,
-        ).returncode
-        == 0
-    )
-    if not exists:
-        created = subprocess.run(
-            [
-                "gh",
-                "release",
-                "create",
-                tag,
-                "--repo",
-                repo,
-                "--title",
-                "Abi Toads wallpapers",
-                "--notes",
-                (
-                    "Abi Toads wallpapers, sourced from the Steam Workshop. "
-                    "Assets are named <Name>.mp4 and are immutable; see "
-                    "workshop.json for the sha256-pinned manifest."
-                ),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if created.returncode != 0:
-            die(f"failed to create release {tag}:\n{created.stderr.strip()}")
-        ok(f"created release {paint(tag, Style.BOLD)}")
-
-    existing = github_asset_names(repo, tag)
-
-    with tempfile.TemporaryDirectory() as staging_name:
-        staging = Path(staging_name)
-        to_upload: list[Path] = []
-        skipped = 0
-
-        for name, entry in wallpapers.items():
-            asset = f"{name}.mp4"
-            if asset in existing:
-                skipped += 1
-                continue
-            workshop_id = entry["id"]
-            video_path = item_video_path(workshop_id)
-            if video_path is None:
-                die(
-                    f"[{name}] expected video not found for id {workshop_id}; "
-                    f"download it first (fetch/publish --download)."
-                )
-            # Never upload bytes that don't match the committed hash.
-            actual = sha256_file(video_path)
-            if actual != entry["sha256"]:
-                die(
-                    f"[{name}] sha256 mismatch; refusing to publish.\n"
-                    f"       manifest: {entry['sha256']}\n"
-                    f"       actual:   {actual}"
-                )
-            link = staging / asset
-            link.symlink_to(video_path)
-            to_upload.append(link)
-            step(f"queued {paint(asset, Style.BOLD)}")
-
-        if skipped:
-            info(f"skipping {skipped} asset(s) already present (immutable)")
-
-        if not to_upload:
-            ok("nothing new to upload; release is up to date")
-            return 0
-
-        count = paint(str(len(to_upload)), Style.BOLD)
-        step(f"Uploading {count} new asset(s){Glyph.ELLIPSIS}")
-        subprocess.run(
-            ["gh", "release", "upload", tag, *map(str, to_upload), "--repo", repo],
-            check=True,
-        )
-
-    header("Done")
-    count = paint(str(len(to_upload)), Style.BOLD)
-    ok(f"{count} asset(s) uploaded to {repo} release {paint(tag, Style.BOLD)}")
-    return 0
+    highest = 0
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            match = re.fullmatch(rf"{re.escape(RELEASE_TAG_PREFIX)}(\d+)", line.strip())
+            if match:
+                highest = max(highest, int(match.group(1)))
+    return f"{RELEASE_TAG_PREFIX}{highest + 1}"
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
@@ -528,11 +520,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
     missing = 0
     mismatched: list[str] = []
 
-    header("Verifying local files")
+    header("Verifying collected files")
     for name, entry in wallpapers.items():
-        video_path = item_video_path(entry["id"])
-        if not video_path:
-            info(f"{name} {Glyph.DASH} not downloaded locally, skipping")
+        video_path = COLLECTED_DIR / f"{name}.mp4"
+        if not video_path.is_file():
+            info(f"{name} {Glyph.DASH} not collected in {COLLECTED_DIR}, skipping")
             missing += 1
             continue
         actual = sha256_file(video_path)
@@ -551,12 +543,135 @@ def cmd_verify(args: argparse.Namespace) -> int:
     header("Summary")
     summary = (
         f"{paint(str(checked), Style.BOLD)} ok, "
-        f"{len(mismatched)} mismatched, {missing} not downloaded"
+        f"{len(mismatched)} mismatched, {missing} not collected"
     )
     if mismatched:
         print(f"{paint(str(Glyph.ERROR), Style.RED)} {summary}")
         return 1
     ok(summary)
+    return 0
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    repo = REPO
+
+    ensure_github_auth()
+
+    data = load_manifest()
+    wallpapers = data["wallpapers"]
+    if not wallpapers:
+        die(f"{MANIFEST} has no wallpapers; run 'register' first.")
+
+    # Ensure every item is downloaded locally (CI re-downloads from Steam).
+    if args.download:
+        user = resolve_steam_user()
+        ids = sorted({entry["id"] for entry in wallpapers.values()})
+        steam_download(user, ids)
+
+    tag = next_release_tag(repo)
+
+    header(f"Publishing to {repo}")
+    step(f"New release snapshot {paint(tag, Style.BOLD)}")
+
+    with tempfile.TemporaryDirectory() as staging_name:
+        staging = Path(staging_name)
+        to_upload: list[Path] = []
+        missing: list[str] = []
+        mismatched: list[tuple[str, str, str]] = []
+
+        # The release is a snapshot of the full current set; every wallpaper is
+        # included, so consumers can grab everything from `releases/latest`.
+        # Verify ALL of them before creating anything, so a mismatch never
+        # leaves a half-published release and every problem is reported at once.
+        for name, entry in wallpapers.items():
+            asset = f"{name}.mp4"
+            workshop_id = entry["id"]
+            video_path = item_video_path(workshop_id)
+            if video_path is None:
+                missing.append(f"{name} (id {workshop_id})")
+                continue
+            # Never upload bytes that don't match the committed hash.
+            actual = sha256_file(video_path)
+            if actual != entry["sha256"]:
+                mismatched.append((name, entry["sha256"], actual))
+                continue
+            link = staging / asset
+            link.symlink_to(video_path)
+            to_upload.append(link)
+            step(f"queued {paint(asset, Style.BOLD)}")
+
+        if missing or mismatched:
+            lines = [
+                paint(
+                    "refusing to publish: the manifest does not match the ", Style.RED
+                )
+                + paint("downloaded videos.", Style.RED),
+            ]
+            if missing:
+                lines.append("")
+                lines.append(paint("missing downloads:", Style.BOLD))
+                lines += [f"  - {item}" for item in missing]
+            if mismatched:
+                lines.append("")
+                lines.append(paint("sha256 mismatches:", Style.BOLD))
+                for name, expected, actual in mismatched:
+                    lines.append(f"  - {paint(name, Style.BOLD)}")
+                    lines.append(f"      manifest: {expected}")
+                    lines.append(f"      actual:   {actual}")
+            lines.append("")
+            lines.append(
+                "A mismatch means the upstream video no longer matches the "
+                "approved manifest."
+            )
+            lines.append(
+                "This needs maintainer review -- do NOT auto-accept it in CI. "
+                "Locally run"
+            )
+            lines.append(
+                "'just fetch --update' (or 're-register' the item), review the "
+                "workshop.json"
+            )
+            lines.append(
+                "diff, and commit it; the push re-triggers a clean publish. "
+                "No release was created."
+            )
+            die("\n".join(lines))
+
+        count = paint(str(len(to_upload)), Style.BOLD)
+        tag_label = paint(tag, Style.BOLD)
+        step(f"Creating {tag_label}, uploading {count} asset(s){Glyph.ELLIPSIS}")
+        created = subprocess.run(
+            [
+                "gh",
+                "release",
+                "create",
+                tag,
+                *map(str, to_upload),
+                "--repo",
+                repo,
+                "--latest",
+                "--title",
+                f"Abi Toads wallpapers {tag}",
+                "--notes",
+                (
+                    "Abi Toads wallpapers, sourced from the Steam Workshop. A "
+                    "snapshot of the full current set; assets are named "
+                    "<Name>.mp4. See workshop.json for the sha256-pinned "
+                    "manifest. Consumers can pull the current set from "
+                    "releases/latest/download/<Name>.mp4."
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if created.returncode != 0:
+            die(f"failed to create release {tag}:\n{created.stderr.strip()}")
+
+    header("Done")
+    count = paint(str(len(to_upload)), Style.BOLD)
+    ok(f"{count} asset(s) published to {repo} release {paint(tag, Style.BOLD)}")
+    info("it is now the latest release; consumers can pull releases/latest")
     return 0
 
 
@@ -569,11 +684,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="abitoads", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    fetch_parser = subparsers.add_parser(
-        "fetch", help="download item(s) and record in manifest"
+    register_parser = subparsers.add_parser(
+        "register", help="download item(s), name them, and record in the manifest"
     )
-    fetch_parser.add_argument("user", help="Steam username that owns Wallpaper Engine")
-    fetch_parser.add_argument("ids", nargs="+", help="Steam Workshop item id(s)")
+    register_parser.add_argument("ids", nargs="+", help="Steam Workshop item id(s)")
+    register_parser.set_defaults(func=cmd_register)
+
+    fetch_parser = subparsers.add_parser(
+        "fetch", help="download every manifest item and collect it into .wallpapers/"
+    )
+    fetch_parser.add_argument(
+        "--update",
+        action="store_true",
+        help="update the manifest sha256 to match downloaded content instead of "
+        "failing on a mismatch",
+    )
     fetch_parser.set_defaults(func=cmd_fetch)
 
     publish_parser = subparsers.add_parser(
@@ -581,19 +706,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_parser.add_argument(
         "--download",
-        nargs="?",
-        const="",
-        default=None,
-        metavar="STEAM_USER",
-        help=(
-            "re-download manifest items from Steam before uploading; "
-            "optionally takes the Steam username (defaults to $STEAM_USER)"
-        ),
+        action="store_true",
+        help="re-download manifest items from Steam before uploading",
     )
     publish_parser.set_defaults(func=cmd_publish)
 
     verify_parser = subparsers.add_parser(
-        "verify", help="re-hash local files against the manifest"
+        "verify", help="re-hash the collected .wallpapers/ files against the manifest"
     )
     verify_parser.set_defaults(func=cmd_verify)
 

@@ -5,17 +5,19 @@
 # This is meant to be run ONCE on the maintainer's own server, from the repo
 # root (the justfile ensures that). It:
 #   1. downloads and configures the runner with the `steam-publish` label,
-#   2. stores STEAM_USER and GH_TOKEN in secretspec so publish can inject them,
+#   2. writes STEAM_USER and GH_TOKEN to the runner's .env so every job inherits
+#      them in its environment,
 #   3. installs and starts the runner as a service.
 #
 # Steam and gh credentials stay on this server. The workflow runs everything
 # through `devenv shell`, so the runner itself only needs devenv (which provides
 # gh, steamcmd, just, python3 and secretspec); nothing else has to be installed.
-# The secrets are declared in secretspec.toml and injected into publish by
-# `secretspec run`, so no secret values are written to the repo or exported into
-# the job's environment ahead of time. Before the first publish run, prime the
-# Steam session once with:  steamcmd +login "$STEAM_USER" +quit  (approve the
-# Steam Guard prompt; the cached sentry makes CI logins silent).
+# The publish step sets SECRETSPEC_PROVIDER=env so the tool's secretspec SDK
+# resolves the two env vars in-process (it errors if either is unset).
+# Before the
+# first publish run, prime the Steam session once with:
+#   steamcmd +login "$STEAM_USER" +quit
+# (approve the Steam Guard prompt; the cached sentry makes CI logins silent).
 
 set -euo pipefail
 
@@ -23,11 +25,6 @@ REPO="rhedgeco/abitoads"
 RUNNER_LABEL="steam-publish"
 RUNNER_DIR="${RUNNER_DIR:-$HOME/actions-runner-abitoads}"
 RUNNER_VERSION="${RUNNER_VERSION:-2.321.0}"
-# secretspec stores the values here, outside any repo checkout, matching the
-# `server` provider declared in secretspec.toml. Keeping it under ~/.config
-# means it is stable across the runner's per-job checkouts and never in a repo.
-SECRET_ENV="${SECRET_ENV:-$HOME/.config/abitoads/.env}"
-SECRET_PROVIDER="dotenv:${SECRET_ENV}"
 
 die() {
     printf 'error: %s\n' "$1" >&2
@@ -36,12 +33,6 @@ die() {
 
 command -v curl >/dev/null || die "curl is required but not found on PATH."
 command -v tar >/dev/null || die "tar is required but not found on PATH."
-command -v secretspec >/dev/null \
-    || die "secretspec not found on PATH; run this inside the devenv shell."
-
-repo_root="$PWD"
-[ -f "$repo_root/secretspec.toml" ] \
-    || die "secretspec.toml not found; run this from the repo root."
 
 # A registration token is short-lived; the maintainer gets one from:
 #   GitHub -> repo Settings -> Actions -> Runners -> New self-hosted runner
@@ -68,11 +59,6 @@ if [ -z "$github_token" ]; then
 fi
 [ -n "$github_token" ] || die "a GitHub token is required for gh to edit releases."
 
-printf 'Storing secrets with secretspec at %s\n' "$SECRET_ENV"
-mkdir -p "$(dirname "$SECRET_ENV")"
-printf '%s' "$steam_user" | secretspec set STEAM_USER --provider "$SECRET_PROVIDER"
-printf '%s' "$github_token" | secretspec set GH_TOKEN --provider "$SECRET_PROVIDER"
-
 printf 'Setting up runner in %s\n' "$RUNNER_DIR"
 mkdir -p "$RUNNER_DIR"
 cd "$RUNNER_DIR"
@@ -98,6 +84,15 @@ fi
     --name "$(hostname)-abitoads" \
     --labels "$RUNNER_LABEL" \
     --replace
+
+# The runner reads this .env in its install dir and injects the variables into
+# every job's environment, where the publish step (with SECRETSPEC_PROVIDER=env)
+# resolves them via the secretspec env provider.
+printf 'Recording secrets in the runner .env\n'
+{
+    printf 'STEAM_USER=%s\n' "$steam_user"
+    printf 'GH_TOKEN=%s\n' "$github_token"
+} >.env
 
 printf 'Installing and starting the runner service\n'
 sudo ./svc.sh install

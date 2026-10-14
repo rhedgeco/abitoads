@@ -22,10 +22,9 @@ push_file() {
 
 for path in "$@"; do
   if [ -d "$path" ]; then
-    for file in "$path"/*.mp4; do
-      [ -e "$file" ] || continue
+    while IFS= read -r -d '' file; do
       push_file "$file"
-    done
+    done < <(find "$path" -type f -name '*.mp4' -print0)
   elif [ -f "$path" ]; then
     push_file "$path"
   else

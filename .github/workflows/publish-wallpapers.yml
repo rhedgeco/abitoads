@@ -1,7 +1,8 @@
 name: publish-wallpapers
 
-# Downloads the manifest's wallpapers from the Steam Workshop and uploads any
-# that are missing from the single long-lived `wallpapers` release.
+# Downloads the manifest's wallpapers from the Steam Workshop and cuts a new
+# release snapshot (v1, v2, ...) holding the full current set, which becomes
+# GitHub's `releases/latest`.
 #
 # This runs on a SELF-HOSTED runner (the maintainer's own server) because:
 #   - the videos come from Wallpaper Engine, a paid Steam app behind Steam Guard,
@@ -19,10 +20,12 @@ name: publish-wallpapers
 #   - devenv + nix available to the runner. The workflow runs everything through
 #     `devenv shell`, so devenv provides gh, steamcmd, just, python3 and
 #     secretspec; no other tools need to be installed on the server.
-#   - STEAM_USER and GH_TOKEN stored in secretspec (keyring provider) on the
-#     server. They are declared in secretspec.toml and injected into publish by
-#     `secretspec run`, so no secret values are written to disk or the repo.
-#     GH_TOKEN needs permission to edit releases on this repo.
+#   - STEAM_USER and GH_TOKEN set in the runner's environment (init-runner writes
+#     them to the runner's .env, which the runner injects into every job). The
+#     publish step sets SECRETSPEC_PROVIDER=env so the tool's secretspec SDK
+#     resolves both secrets straight from that environment in-process (the tool
+#     errors if either is unset). GH_TOKEN needs permission to edit releases on
+#     this repo.
 #   - a one-time interactive `steamcmd +login <STEAM_USER>` on the server to
 #     cache the Steam Guard sentry, so later CI logins are non-interactive.
 
@@ -45,4 +48,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Publish wallpapers
-        run: devenv shell -- secretspec run -- just publish --download
+        env:
+          # Resolve STEAM_USER and GH_TOKEN (present in the runner's job
+          # environment, from its .env) via the secretspec env provider, which
+          # the tool's SDK reads in-process. No secrets are defined here.
+          SECRETSPEC_PROVIDER: env
+        run: devenv shell -- just publish --download

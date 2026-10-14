@@ -1,0 +1,6 @@
+{
+  "venvPath": ".devenv/state",
+  "venv": "venv",
+  "typeCheckingMode": "standard",
+  "reportMissingTypeStubs": false,
+}

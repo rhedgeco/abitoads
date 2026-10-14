@@ -1,6 +1,9 @@
-# Local Steam Workshop fetch artifacts (steamcmd binaries + downloaded content).
+# Local Steam Workshop fetch artifacts (downloaded workshop content).
 # These are pulled on-demand by scripts/abitoads.py and never committed.
-/.steam-fetch/
+/.steam/
+
+# Clean collection of videos named by their manifest names (just fetch).
+/.wallpapers/
 
 # Python bytecode cache
 __pycache__/
