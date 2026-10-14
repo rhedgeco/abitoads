@@ -560,10 +560,8 @@ def next_release_tag(repo: str) -> str:
 
 
 RELEASE_NOTES = (
-    "Abi Toads wallpapers, sourced from the Steam Workshop. A snapshot of the "
-    "full current set; assets are named <Name>.mp4. See workshop.json for the "
-    "sha256-pinned manifest. Consumers can pull the current set from "
-    "releases/latest/download/<Name>.mp4."
+    "Abi Toads wallpapers, sourced from the Steam Workshop. "
+    "A snapshot of the full current set."
 )
 
 
@@ -584,7 +582,7 @@ def create_empty_release(repo: str, tag: str) -> None:
             repo,
             "--latest",
             "--title",
-            f"Abi Toads wallpapers {tag}",
+            f"Wallpaper Release {tag}",
             "--notes",
             RELEASE_NOTES,
         ],
