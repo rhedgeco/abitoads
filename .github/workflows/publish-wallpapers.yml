@@ -1,8 +1,9 @@
 name: publish-wallpapers
 
 # Downloads the manifest's wallpapers from the Steam Workshop and cuts a new
-# release snapshot (v1, v2, ...) holding the full current set, which becomes
-# GitHub's `releases/latest`.
+# release snapshot (release1, release2, ...) holding the full current set, then
+# appends a manifest.json commit to the distribution `release` branch so the Nix
+# flake (and its consumers' locks) resolve the new release.
 #
 # This runs on a SELF-HOSTED runner (the maintainer's own server) because:
 #   - the videos come from Wallpaper Engine, a paid Steam app behind Steam Guard,
@@ -18,14 +19,15 @@ name: publish-wallpapers
 #   - a GitHub Actions self-hosted runner registered to this repo, with the
 #     label `steam-publish` (see runs-on below).
 #   - devenv + nix available to the runner. The workflow runs everything through
-#     `devenv shell`, so devenv provides gh, steamcmd, just, python3 and
-#     secretspec; no other tools need to be installed on the server.
+#     `devenv shell`, so devenv provides gh, steamcmd, just and python3; no other
+#     tools need to be installed on the server.
 #   - STEAM_USER set in the runner's environment (`just runner` writes it to the
 #     runner's .env, which the runner injects into every job). The publish step
-#     sets SECRETSPEC_PROVIDER=env so the tool's secretspec SDK resolves it
-#     straight from that environment in-process (the tool errors if it is unset).
+#     reads $STEAM_USER directly for the non-interactive Steam download.
 #   - gh uses the job's built-in GITHUB_TOKEN to edit releases (exposed to the
-#     step as GH_TOKEN below); no personal token is needed on the runner.
+#     step as GH_TOKEN below) AND to push the manifest commit to the `release`
+#     branch (actions/checkout persists it as the git credential); no personal
+#     token is needed on the runner.
 #   - a one-time interactive `steamcmd +login <STEAM_USER>` on the server to
 #     cache the Steam Guard sentry, so later CI logins are non-interactive.
 
@@ -50,14 +52,18 @@ jobs:
     runs-on: [self-hosted, steam-publish]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history so the publish step can add a git worktree for the
+          # `release` branch and append the manifest commit to it.
+          fetch-depth: 0
 
       - name: Publish wallpapers
         env:
           # gh reads GH_TOKEN straight from the environment; the job's built-in
           # GITHUB_TOKEN (contents:write, granted above) is enough to cut the
-          # release, so no personal token is needed here.
+          # release and push the manifest commit to the release branch, so no
+          # personal token is needed here.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # STEAM_USER lives in the runner's own environment (from its .env);
-          # the secretspec env provider resolves it in-process for the download.
-          SECRETSPEC_PROVIDER: env
+          # the publish step reads it directly for the Steam download.
         run: devenv shell -- just publish --download

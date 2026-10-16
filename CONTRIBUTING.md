@@ -3,8 +3,10 @@
 This repository does **not** store the wallpaper videos. It stores a manifest,
 [`workshop.json`](./workshop.json), mapping each wallpaper's clean **name** to
 its Steam Workshop `id` and the video's `sha256`. The actual `.mp4` files are
-published as assets on GitHub releases (each publish cuts a new snapshot that
-becomes `releases/latest`).
+published as assets on GitHub releases. Each publish cuts a new snapshot tagged
+`release1`, `release2`, ... holding the full current set; the `release` branch
+carries a `manifest.json` and the Nix flake, pinning each name to the release it
+was published in.
 
 All tooling lives in a single stdlib-only CLI, `scripts/abitoads.py`, exposed
 through the justfile.
@@ -41,7 +43,8 @@ and a valid `sha256`, each name is filename-safe). After merge, pushing the
 `workshop.json` change to `main` automatically triggers publishing on the
 maintainer's self-hosted runner, which re-downloads each item from Steam and
 re-hashes it against the committed `sha256`, aborting on any mismatch -- so a
-wrong hash can never reach the release.
+wrong hash can never reach the release. The runner then cuts the new `releaseN`
+snapshot and appends the regenerated `manifest.json` to the `release` branch.
 
 If you'd rather not edit JSON, opening an issue with the Workshop `id` is also
 fine.
@@ -53,12 +56,13 @@ and records them in `workshop.json` for you, so you don't have to compute hashes
 by hand.
 
 Prerequisites: `just` and `python3`, plus `steamcmd` (on NixOS it runs via
-`steam-run`) and the secretspec SDK. A `devenv` shell provides all of these.
-Your Steam username is resolved through [secretspec](./secretspec.toml) (the
-`STEAM_USER` secret), not passed on the command line.
+`steam-run`). A `devenv` shell provides all of these. Your Steam username is
+resolved from the `--user` flag, else the `$STEAM_USER` environment variable,
+else an interactive prompt:
 
 ```sh
 just register <workshop-id> [workshop-id ...]
+just register --user <steam-username> <workshop-id> [workshop-id ...]
 ```
 
 This downloads each item (steamcmd handles your password and Steam Guard

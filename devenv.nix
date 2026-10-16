@@ -8,16 +8,6 @@
     git # version control
     steamcmd # downloads workshop items (abitoads.py register / fetch)
     steam-run # FHS wrapper steamcmd needs on NixOS
+    python3 # runs scripts/abitoads.py (standard library only)
   ];
-
-  # Python for scripts/abitoads.py. A venv provides the secretspec SDK
-  languages.python = {
-    enable = true;
-    venv = {
-      enable = true;
-      requirements = ''
-        secretspec
-      '';
-    };
-  };
 }

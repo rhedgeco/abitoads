@@ -1,58 +1,38 @@
 # Abitoads Wallpaper Collection
 
 A mirror of [Abi Toads](https://abitoads.com) animated wallpapers, sourced from
-the [Steam Workshop](https://steamcommunity.com/app/431960/workshop/) (Wallpaper
-Engine).
+[Steam Workshop](https://steamcommunity.com/app/431960/workshop/) (Wallpaper Engine).
 
-The video files are **not stored in this repository.** Instead, this repo holds
-a small manifest, [`workshop.json`](./workshop.json), that maps a clean name to
-each wallpaper's Steam Workshop id and `sha256`. The actual `.mp4` files are
-published as assets on GitHub releases, so the repo stays tiny and easy to pull
-into other projects (e.g. a Nix config).
-
-## How it works
-
-- Every wallpaper has a clean, stable name (e.g. `AxolotlRide`). That name is
-  the manifest key, the release asset name (`AxolotlRide.mp4`), and the on-disk
-  filename.
-- Each publish cuts a **new release** (`v1`, `v2`, ...) containing the **full
-  current set** of wallpapers. GitHub's `releases/latest` pointer always tracks
-  the newest, so the latest release is always the complete, current collection.
-- When a wallpaper is updated by the artist, its entry keeps the **same name**
-  and its `sha256` is updated in place; the next release carries the new bytes
-  under that same asset name. There are no `V2`-style suffixes.
-- Releases are snapshots: a given tag (e.g. `v3`) is never edited after it is
-  cut, so anything pinned to a specific release tag keeps working. Your
-  "version" is either a release tag or the commit of `workshop.json` you pin.
+The video files are **not stored in this repository.**
+Instead, the `main` branch holds a small manifest, [`workshop.json`](./workshop.json),
+that maps a clean name to each wallpaper's Steam Workshop id and `sha256`.
+The actual `.mp4` files are published as assets on GitHub releases.
 
 ## Downloading the wallpapers
 
-Each wallpaper is an individual asset on the latest release, downloadable by
-name:
+Each wallpaper is an individual asset on a release, downloadable by name:
 
 ```
 https://github.com/rhedgeco/abitoads/releases/latest/download/AxolotlRide.mp4
 ```
 
-To pin a specific snapshot, swap `latest` for a tag, e.g.
-`releases/download/v3/AxolotlRide.mp4`. The names and their integrity hashes are
-listed in [`workshop.json`](./workshop.json).
+To pin a specific release, use a tag instead,
+e.g. `releases/download/release3/AxolotlRide.mp4`.
+The names and their integrity hashes are listed in [`workshop.json`](./workshop.json).
 
 ### Using the wallpapers from Nix
 
-The repo is a flake. Each wallpaper is a `pkgs.fetchurl` derivation (pinned by
-`sha256`), so builds are substitutable from binary caches, run on remote
-builders, and download nothing at eval time. The outputs live under the standard
-per-system `packages.<system>` attribute:
+The `release` branch is a flake, that imports a manifest.
+The manifest is updated for every new release and maps the file to its hash.
 
 ```nix
 {
-  inputs.abitoads.url = "github:rhedgeco/abitoads";
+  inputs.abitoads.url = "github:rhedgeco/abitoads/release";
 
   outputs = { self, nixpkgs, abitoads }:
     let system = "x86_64-linux"; in {
       # one wallpaper (a <Name>.mp4 derivation)
-      #   abitoads.packages.${system}.LazyRiver
+      #   abitoads.packages.${system}.wallpapers.LazyRiver
       # a directory of every <Name>.mp4
       #   abitoads.packages.${system}.all
     };
@@ -63,64 +43,20 @@ From the CLI the same outputs build directly, with your current system filled in
 automatically:
 
 ```
-nix build github:rhedgeco/abitoads#LazyRiver   # individual file
-nix build github:rhedgeco/abitoads#all         # directory of every <Name>.mp4
+nix build github:rhedgeco/abitoads/release#wallpapers.LazyRiver   # individual file
+nix build github:rhedgeco/abitoads/release#all                    # directory of every <Name>.mp4
 ```
 
-`all` is also the default package (`nix build github:rhedgeco/abitoads`).
+`all` is also the default package (`nix build github:rhedgeco/abitoads/release`).
 
-If you already have a `pkgs` in scope and would rather not index by system, use
-the overridable `fetchWallpapers` helper. It is just `import ./.`, so it also
-lets you pin a release tag or supply your own manifest:
+If you already have a `pkgs` in scope and would rather not index by system,
+use the overridable `fetch` helper. It is just `import ./.` on the `release` branch,
+so it also lets you supply your own `pkgs`, `owner`, `repo`, or `manifest`:
 
 ```nix
-abitoads.fetchWallpapers { inherit pkgs; tag = "v3"; }
+abitoads.fetch { inherit pkgs; }
 # => { wallpapers = { LazyRiver = <drv>; ... }; all = <drv>; }
 ```
-
-By default the assets come from the mutable `latest` release. The content is
-hash-pinned so it is reproducible, but the `latest` URL can 404 once the set
-changes, so pin a snapshot tag (e.g. `v3`) for a frozen reference. Non-flake
-users can `import` [`default.nix`](./default.nix) directly with the same
-arguments (`pkgs`, `owner`, `repo`, `tag`, `manifest`).
-
-## Maintaining the collection
-
-The video source of truth is the Steam Workshop, which requires an account that
-owns Wallpaper Engine (a paid app) and an interactive, Steam Guard-confirmed
-login. Registering new items is therefore done **locally** by the maintainer.
-Everything runs through the [`justfile`](./justfile) inside a `devenv` shell,
-which provides `just`, `python3`, `steamcmd`, `gh`, and the rest. Credentials
-(`STEAM_USER`, `GH_TOKEN`) are resolved through
-[secretspec](./secretspec.toml), so no usernames or tokens are passed on the
-command line.
-
-```sh
-# Register one or more Workshop items by id into workshop.json. Prompts for a
-# name for each new item; an updated item just has its sha256 refreshed in
-# place (steamcmd handles login).
-just register <workshop-id> [workshop-id ...]
-
-# Download every manifest item from Steam, verify it against the manifest
-# sha256, and collect the videos into .wallpapers/. Add --update to refresh
-# the manifest sha256 to match downloaded content instead of failing on a
-# mismatch (useful when the artist updates a wallpaper).
-just fetch [--update]
-
-# Re-hash the collected .wallpapers/ videos against the manifest.
-just verify
-
-# Cut a new release snapshot (v1, v2, ...) holding the full current set, which
-# becomes releases/latest. Add --download to re-pull every manifest item from
-# Steam first (what the publish runner uses).
-just publish [--download]
-```
-
-Publishing re-hashes each `.mp4` against the committed `sha256` and aborts on any
-mismatch, so a wrong hash can never reach the release. Pushing a `workshop.json`
-change to `main` also triggers publishing automatically on the maintainer's
-self-hosted runner, cutting a fresh release snapshot; see
-[`CONTRIBUTING.md`](./CONTRIBUTING.md) for the contributor workflow.
 
 ## License & attribution
 

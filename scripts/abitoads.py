@@ -2,8 +2,8 @@
 """Abi Toads wallpaper tooling.
 
 A small CLI for managing the Steam Workshop -> GitHub release pipeline for Abi
-Toads animated wallpapers. It uses only the Python standard library plus the
-secretspec SDK (provided by the devenv) to resolve credentials.
+Toads animated wallpapers. It uses only the Python standard library (provided by
+the devenv).
 
 Subcommands:
     register <id>...  download item(s), hash, name, record in the manifest
@@ -19,18 +19,25 @@ Design / model (see README, CONTRIBUTING):
       ("<Name>.mp4"), and the on-disk name. When a wallpaper's content changes,
       its entry keeps the same NAME and its sha256 is updated in place (keyed by
       the Workshop id, which is stable across versions).
-    * Each publish cuts a NEW release tag (v1, v2, ...) holding the full current
-      set, so GitHub's `releases/latest` always points at the current snapshot.
-      Consumers fetch `releases/latest/download/<Name>.mp4`.
+    * Each publish cuts a NEW release tag (release1, release2, ...) holding the
+      full current set of videos. The tag number is permanent, so an old Nix
+      pin keeps resolving the exact bytes it locked.
+    * After uploading, publish regenerates manifest.json ({"release": N,
+      "wallpapers": {name -> sha256}}) and appends a commit to the `release`
+      branch. That branch carries the Nix flake; consumers pin
+      `github:rhedgeco/abitoads/release` and fetch
+      `releases/download/release<N>/<Name>.mp4`. Its append-only history is what
+      keeps older flake pins reproducible.
     * The original Workshop filename is NOT stored -- it is read from each
       item's project.json when needed. No URL is stored; consumers build it.
 
-The videos come from Wallpaper Engine (paid app, Steam Guard). Steam and GitHub
-credentials (STEAM_USER, GH_TOKEN) are resolved through secretspec, which each
-environment provisions however it likes (see secretspec.toml). `register` is
-interactive (name prompt + Steam Guard); `fetch`/`publish` are not. Before
-uploading, publish re-hashes each local file against the committed sha256 and
-aborts on any mismatch.
+The videos come from Wallpaper Engine (paid app, Steam Guard). The Steam
+username and an optional GitHub token are resolved from, in order: a command
+flag (--user / --token), an environment variable (STEAM_USER / GH_TOKEN), or an
+interactive prompt. When no token is given, gh falls back to its own persisted
+login (`gh auth login`). `register` is interactive (name prompt + Steam Guard);
+`fetch`/`publish` are not. Before uploading, publish re-hashes each local file
+against the committed sha256 and aborts on any mismatch.
 """
 
 from __future__ import annotations
@@ -50,18 +57,19 @@ import tempfile
 import time
 import urllib.request
 from enum import Enum
-from functools import lru_cache
 from pathlib import Path
 from typing import NoReturn
-
-from secretspec import SecretSpec, SecretSpecError
 
 # workshop and repo ids
 APP_ID = "431960"
 REPO = "rhedgeco/abitoads"
-# Each publish cuts a new snapshot release tagged v1, v2, ...; GitHub's
-# `releases/latest` pointer then tracks the newest by semver.
-RELEASE_TAG_PREFIX = "v"
+# Each publish cuts a new snapshot release tagged release1, release2, ...; the
+# number is permanent so old Nix pins stay reproducible.
+RELEASE_TAG_PREFIX = "release"
+# The machine-generated distribution branch that carries the Nix flake and the
+# manifest.json that pins each wallpaper to the release it was published in.
+RELEASE_BRANCH = "release"
+RELEASE_MANIFEST = "manifest.json"
 # Large asset uploads to GitHub occasionally time out (HTTP 408/5xx); retry each
 # upload a few times with backoff before giving up.
 UPLOAD_ATTEMPTS = 4
@@ -179,45 +187,51 @@ def is_on_path(command: str) -> bool:
 
 
 # --------------------------------------------------------------------------
-# secrets (resolved through secretspec; each environment provisions the
-# provider, see secretspec.toml)
+# credentials
+#
+# The Steam username and an optional GitHub token are resolved the same way: a
+# command flag wins, then an environment variable, then (for the Steam user) an
+# interactive prompt. Neither is stored by this tool -- steamcmd caches its own
+# Steam Guard sentry and gh persists its own login, so both are only needed the
+# first time or when running non-interactively (CI passes them via the env).
 # --------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
-def load_secrets() -> dict[str, str]:
-    """Resolve the declared secrets via secretspec, cached for the process.
-
-    The secrets are declared optional in secretspec.toml so resolution never
-    fails just because one is absent; each command enforces only the secret it
-    actually needs via require_secret(). The provider (env, dotenv, keyring,
-    ...) is chosen by the environment, not here.
-    """
-    try:
-        resolved = SecretSpec.builder().with_reason("abitoads wallpaper tooling").load()
-    except SecretSpecError as error:
-        die(f"could not resolve secrets via secretspec: {error}")
-    return {name: (secret.get or "") for name, secret in resolved.secrets.items()}
+def resolve_steam_user(flag_value: str | None) -> str:
+    """The Steam username: --user flag, else $STEAM_USER, else a prompt."""
+    user = flag_value or os.environ.get("STEAM_USER")
+    if not user:
+        user = prompt_tty("Steam username that owns Wallpaper Engine: ")
+    if not user:
+        die("no Steam username given; pass --user or set $STEAM_USER.")
+    return user
 
 
-def require_secret(name: str) -> str:
-    value = load_secrets().get(name)
-    if not value:
-        die(f"{name} is not set; provision it via secretspec (see secretspec.toml).")
-    return value
+def ensure_github_auth(flag_value: str | None) -> None:
+    """Make sure gh can act on the repo.
 
-
-def ensure_github_auth() -> None:
-    """Ensure gh is available and authenticated.
-
-    gh reads GH_TOKEN from the environment. In CI the workflow already exports
-    it (the job's built-in GITHUB_TOKEN), so we use that as-is; locally we
-    resolve it through secretspec and export it.
+    A token resolves from the --token flag or $GH_TOKEN (CI sets the latter from
+    the job's built-in GITHUB_TOKEN); when present it is exported so gh uses it.
+    With no token, gh falls back to its own persisted login (`gh auth login`),
+    which we confirm with `gh auth status` and otherwise explain how to fix.
     """
     if not is_on_path("gh"):
         die("gh is required but not found on PATH; enter the devenv shell first.")
-    if not os.environ.get("GH_TOKEN"):
-        os.environ["GH_TOKEN"] = require_secret("GH_TOKEN")
+    token = flag_value or os.environ.get("GH_TOKEN")
+    if token:
+        os.environ["GH_TOKEN"] = token
+        return
+    status = subprocess.run(
+        ["gh", "auth", "status"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        die(
+            "gh is not authenticated. Run 'gh auth login' once, or pass --token "
+            "(or set $GH_TOKEN) with a token that has contents:write on the repo."
+        )
 
 
 def load_manifest() -> dict:
@@ -298,11 +312,6 @@ def collect_video(name: str, video_path: Path) -> Path:
 # --------------------------------------------------------------------------
 
 
-def resolve_steam_user() -> str:
-    """The Steam username, resolved through secretspec."""
-    return require_secret("STEAM_USER")
-
-
 def steam_download(user: str, ids: list[str]) -> None:
     """Download workshop items via steamcmd (interactive login).
 
@@ -380,7 +389,7 @@ def prompt_name(suggestion: str, wallpapers: dict) -> str:
 
 
 def cmd_register(args: argparse.Namespace) -> int:
-    user = resolve_steam_user()
+    user = resolve_steam_user(args.user)
     ids = args.ids
 
     steam_download(user, ids)
@@ -455,7 +464,7 @@ def cmd_register(args: argparse.Namespace) -> int:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
-    user = resolve_steam_user()
+    user = resolve_steam_user(args.user)
 
     data = load_manifest()
     wallpapers = data["wallpapers"]
@@ -540,10 +549,10 @@ def existing_git_tags(repo: str) -> set[str]:
 
 
 def next_release_tag(repo: str) -> str:
-    """The next free snapshot tag (v1, v2, ...).
+    """The next free snapshot tag (release1, release2, ...).
 
-    One past the highest existing vN, but also skipping any tag that is already
-    taken -- by a release OR by a dangling git tag -- so a retried or
+    One past the highest existing releaseN, but also skipping any tag that is
+    already taken -- by a release OR by a dangling git tag -- so a retried or
     half-failed run never reuses, overwrites, or clobbers an existing one.
     """
     taken = existing_release_tags(repo) | existing_git_tags(repo)
@@ -646,6 +655,93 @@ def upload_asset(repo: str, tag: str, asset: Path) -> bool:
     return False
 
 
+def release_number(tag: str) -> str:
+    """Strip the RELEASE_TAG_PREFIX from a tag, e.g. 'release4' -> '4'."""
+    return tag[len(RELEASE_TAG_PREFIX) :]
+
+
+def push_release_manifest(repo: str, release: str, wallpapers: dict[str, str]) -> None:
+    """Append a manifest commit to the distribution `release` branch.
+
+    The `release` branch carries the Nix flake plus a manifest.json that pins
+    each wallpaper name to its sha256 and records which release tag holds the
+    bytes. Consumers pin `github:rhedgeco/abitoads/release`, so this branch's
+    append-only history keeps older flake locks reproducible.
+
+    We update it with an isolated git worktree checked out to `release`: fetch
+    the branch, write manifest.json, commit, and push. Only manifest.json is
+    touched here -- the flake files on `release` are left untouched.
+    """
+    header("Updating release branch")
+    step(f"Fetching {paint(RELEASE_BRANCH, Style.BOLD)}")
+    # Make sure we have the branch locally before adding a worktree for it.
+    subprocess.run(
+        ["git", "fetch", "origin", RELEASE_BRANCH],
+        check=True,
+    )
+
+    manifest = {
+        "release": release,
+        "wallpapers": dict(sorted(wallpapers.items())),
+    }
+
+    with tempfile.TemporaryDirectory() as worktree_name:
+        worktree = Path(worktree_name)
+        subprocess.run(
+            ["git", "worktree", "add", str(worktree), f"origin/{RELEASE_BRANCH}"],
+            check=True,
+        )
+        try:
+            manifest_path = worktree / RELEASE_MANIFEST
+            with manifest_path.open("w") as manifest_file:
+                json.dump(manifest, manifest_file, indent=2)
+                manifest_file.write("\n")
+
+            subprocess.run(
+                ["git", "-C", str(worktree), "add", RELEASE_MANIFEST],
+                check=True,
+            )
+            status = subprocess.run(
+                ["git", "-C", str(worktree), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            if not status.stdout.strip():
+                ok(f"{RELEASE_MANIFEST} already up to date; nothing to commit")
+                return
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "commit",
+                    "-m",
+                    f"release {release}",
+                ],
+                check=True,
+            )
+            step(f"Pushing {paint(RELEASE_BRANCH, Style.BOLD)}")
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "push",
+                    "origin",
+                    f"HEAD:{RELEASE_BRANCH}",
+                ],
+                check=True,
+            )
+            ok(f"{RELEASE_MANIFEST} committed for release {release}")
+        finally:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree)],
+                check=False,
+            )
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     data = load_manifest()
     wallpapers = data["wallpapers"]
@@ -691,7 +787,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def cmd_publish(args: argparse.Namespace) -> int:
     repo = REPO
 
-    ensure_github_auth()
+    ensure_github_auth(args.token)
 
     data = load_manifest()
     wallpapers = data["wallpapers"]
@@ -699,8 +795,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
         die(f"{MANIFEST} has no wallpapers; run 'register' first.")
 
     # Ensure every item is downloaded locally (CI re-downloads from Steam).
-    if args.download:
-        user = resolve_steam_user()
+    if args.download is not None:
+        # --download optionally carries the Steam username; fall back to the
+        # usual env-or-prompt resolution when it is passed as a bare flag.
+        user = resolve_steam_user(args.download or None)
         ids = sorted({entry["id"] for entry in wallpapers.values()})
         steam_download(user, ids)
 
@@ -712,11 +810,12 @@ def cmd_publish(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory() as staging_name:
         staging = Path(staging_name)
         to_upload: list[Path] = []
+        verified: dict[str, str] = {}
         missing: list[str] = []
         mismatched: list[tuple[str, str, str]] = []
 
         # The release is a snapshot of the full current set; every wallpaper is
-        # included, so consumers can grab everything from `releases/latest`.
+        # included, so each releaseN tag is the complete collection.
         # Verify ALL of them before creating anything, so a mismatch never
         # leaves a half-published release and every problem is reported at once.
         for name, entry in wallpapers.items():
@@ -737,6 +836,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             # is valid from the staging dir in /tmp.
             link.symlink_to(video_path.resolve())
             to_upload.append(link)
+            verified[name] = entry["sha256"]
             step(f"queued {paint(asset, Style.BOLD)}")
 
         if missing or mismatched:
@@ -802,10 +902,14 @@ def cmd_publish(args: argparse.Namespace) -> int:
                 "re-run publish to try again."
             )
 
+    # The assets are live; now record them on the distribution branch so the
+    # Nix flake (and its consumers' locks) resolve this release.
+    push_release_manifest(repo, release_number(tag), verified)
+
     header("Done")
     count = paint(str(len(to_upload)), Style.BOLD)
     ok(f"{count} asset(s) published to {repo} release {paint(tag, Style.BOLD)}")
-    info("it is now the latest release; consumers can pull releases/latest")
+    info(f"{RELEASE_MANIFEST} on the {RELEASE_BRANCH} branch now points here")
     return 0
 
 
@@ -969,11 +1073,10 @@ def prime_steam_login(user: str) -> None:
 
 
 def cmd_runner(args: argparse.Namespace) -> int:
-    del args
     if not is_on_path("steam-run"):
         die("steam-run not found on PATH; run this through the devenv (just runner).")
 
-    user = resolve_steam_user()
+    user = resolve_steam_user(args.user)
 
     header("Self-hosted runner")
     RUNNER_DIR.mkdir(parents=True, exist_ok=True)
@@ -982,8 +1085,7 @@ def cmd_runner(args: argparse.Namespace) -> int:
     configure_runner()
 
     # The runner reads this .env in its install dir and injects the variable into
-    # every job's environment, where the publish step (SECRETSPEC_PROVIDER=env)
-    # resolves it via the secretspec env provider.
+    # every job's environment, where the publish step reads $STEAM_USER directly.
     (RUNNER_DIR / ".env").write_text(f"STEAM_USER={user}\n")
 
     prime_steam_login(user)
@@ -1011,6 +1113,11 @@ def build_parser() -> argparse.ArgumentParser:
         "register", help="download item(s), name them, and record in the manifest"
     )
     register_parser.add_argument("ids", nargs="+", help="Steam Workshop item id(s)")
+    register_parser.add_argument(
+        "--user",
+        help="Steam username that owns Wallpaper Engine "
+        "(else $STEAM_USER, else prompted)",
+    )
     register_parser.set_defaults(func=cmd_register)
 
     fetch_parser = subparsers.add_parser(
@@ -1022,6 +1129,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="update the manifest sha256 to match downloaded content instead of "
         "failing on a mismatch",
     )
+    fetch_parser.add_argument(
+        "--user",
+        help="Steam username that owns Wallpaper Engine "
+        "(else $STEAM_USER, else prompted)",
+    )
     fetch_parser.set_defaults(func=cmd_fetch)
 
     publish_parser = subparsers.add_parser(
@@ -1029,8 +1141,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     publish_parser.add_argument(
         "--download",
-        action="store_true",
-        help="re-download manifest items from Steam before uploading",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="STEAM_USER",
+        help="re-download manifest items from Steam before uploading; optionally "
+        "takes the Steam username (else $STEAM_USER, else prompted)",
+    )
+    publish_parser.add_argument(
+        "--token",
+        help="GitHub token with contents:write (else $GH_TOKEN, else gh's own login)",
     )
     publish_parser.set_defaults(func=cmd_publish)
 
@@ -1042,6 +1162,11 @@ def build_parser() -> argparse.ArgumentParser:
     runner_parser = subparsers.add_parser(
         "runner",
         help="install, register, prime Steam login, and run the self-hosted runner",
+    )
+    runner_parser.add_argument(
+        "--user",
+        help="Steam username that owns Wallpaper Engine "
+        "(else $STEAM_USER, else prompted)",
     )
     runner_parser.set_defaults(func=cmd_runner)
 

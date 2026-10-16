@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
 # Thin NixOS entry point for the self-hosted runner: run the Python tooling
-# inside the devenv shell so steamcmd, steam-run, python3 and the secretspec
-# venv are all set up, then hand off. The Python `runner` subcommand does all
-# the real work (install, register, prime Steam login, run).
+# inside the devenv shell so steamcmd, steam-run and python3 are all set up,
+# then hand off. The Python `runner` subcommand does all the real work (install,
+# register, prime Steam login, run).
 #
 # The only thing this needs on PATH is devenv. Run it from the repo root (the
 # justfile ensures that). See `abitoads.py runner` for the behavior and flags.
 #
-# We go through `devenv shell -- ...` (rather than just sourcing the exported
-# environment) because the Python virtualenv that provides the secretspec SDK
-# is activated by devenv's shell tasks, which a plain env export does not run.
+# We go through `devenv shell -- ...` so the tool runs with devenv's PATH
+# (steamcmd, steam-run, gh, python3) regardless of the caller's environment.
 
 set -euo pipefail
 
