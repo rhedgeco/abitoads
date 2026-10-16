@@ -22,6 +22,10 @@ fetch *args:
 verify:
     python3 scripts/abitoads.py verify
 
+# cuts a new github release with the full set of wallpapers
+publish *args:
+    python3 scripts/abitoads.py publish {{ args }}
+
 # installs, registers, and primes the steam login to launch a self-hosted runner
 runner:
     ./scripts/runner.sh
